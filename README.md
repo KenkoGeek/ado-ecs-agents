@@ -9,6 +9,8 @@ Serverless solution that runs Azure DevOps build agents on AWS ECS Fargate with 
 - **One task per job** for complete isolation
 - **(Optional) Public networking** to avoid NAT gateways costs
 
+![Diagram](./assets/ado-ecs-agents.png)
+
 ## Components
 
 - **API Gateway + Lambda**: Processes Azure DevOps webhooks and manages ECS scaling
