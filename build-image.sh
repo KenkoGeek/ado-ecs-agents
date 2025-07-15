@@ -28,4 +28,4 @@ docker push ${ECR_URI}:${IMAGE_TAG}
 echo "Image pushed successfully!"
 echo "ECR URI: ${ECR_URI}:${IMAGE_TAG}"
 echo ""
-echo "Use this URI as ECRImageUri parameter when deploying SAM template"
+echo "Use this URI as ECRImageUri parameter when deploying template"
