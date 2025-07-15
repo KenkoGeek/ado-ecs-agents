@@ -1,0 +1,440 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Azure DevOps Agents on ECS Fargate with webhook-based scaling
+
+Parameters:
+  AzureDevOpsUrl:
+    Type: String
+    Description: Azure DevOps organization URL
+    Default: ""
+  
+  AzureDevOpsPAT:
+    Type: String
+    Description: Azure DevOps Personal Access Token
+    NoEcho: true
+    Default: ""
+  
+  AgentPoolName:
+    Type: String
+    Description: Azure DevOps Agent Pool name
+    Default: ""
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID
+    Default: ""
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Existing subnet IDs (public subnets)
+    Default: ""
+  
+  ECRImageUri:
+    Type: String
+    Description: ECR image URI for Azure DevOps agent
+    Default: ""
+
+Resources:
+  # Security Group
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: azure-devops-cluster
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/azure-devops-agents
+      RetentionInDays: 7
+
+  # IAM Roles
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: azure-devops-agent
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 1024
+      Memory: 2048
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: azure-devops-agent
+          Image: !Ref ECRImageUri
+          Essential: true
+          Environment:
+            - Name: AZP_URL
+              Value: !Ref AzureDevOpsUrl
+            - Name: AZP_TOKEN
+              Value: !Ref AzureDevOpsPAT
+            - Name: AZP_POOL
+              Value: !Ref AgentPoolName
+            - Name: AZP_AGENT_NAME
+              Value: !Sub "${AWS::StackName}-agent-${AWS::AccountId}"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: azure-devops-agents
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: ENABLED
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:Describe*
+                  - ecs:DescribeTasks
+                  - ecs:RunTask
+                  - ecs:StopTask
+                  - ecs:List*
+                  - ecs:TagResource
+                Resource: 
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ECSCluster}"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:service/${ECSCluster}/*"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/${ECSCluster}/*"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task-definition/azure-devops-agent:*"
+                  - !Sub "arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/${ECSCluster}/*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt TaskExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-webhook"
+      RetentionInDays: 7
+
+  # API Gateway CloudWatch Role
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account (for CloudWatch logging)
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # API Gateway
+  WebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: azure-devops-webhook
+      Description: API Gateway for Azure DevOps webhooks
+
+  WebhookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ParentId: !GetAtt WebhookApi.RootResourceId
+      PathPart: webhook
+
+  WebhookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref WebhookApi
+      ResourceId: !Ref WebhookResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookProcessor.Arn}/invocations"
+
+  WebhookDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: WebhookMethod
+    Properties:
+      RestApiId: !Ref WebhookApi
+      StageName: prod
+
+  # API Gateway Stage with logging
+  WebhookStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref WebhookApi
+      DeploymentId: !Ref WebhookDeployment
+      StageName: prod
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '$requestId $requestTime $httpMethod $resourcePath $status $responseLength $requestTime'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+
+  # API Key
+  WebhookApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: azure-devops-webhook-key
+      Description: API Key for Azure DevOps webhook authentication
+      Enabled: true
+
+  # Usage Plan
+  WebhookUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: WebhookDeployment
+    Properties:
+      UsagePlanName: azure-devops-webhook-plan
+      Description: Usage plan for Azure DevOps webhooks
+      ApiStages:
+        - ApiId: !Ref WebhookApi
+          Stage: prod
+      Throttle:
+        RateLimit: 100
+        BurstLimit: 200
+
+  # Link API Key to Usage Plan
+  WebhookUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref WebhookApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref WebhookUsagePlan
+
+  # Lambda Functions
+  WebhookProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: azure-devops-webhook-processor
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref ECSCluster
+          ECS_SERVICE: !Ref ECSService
+          SUBNET_IDS: !Join [',', !Ref SubnetIds]
+          SECURITY_GROUP_ID: !Ref ECSSecurityGroup
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ecs_client = boto3.client('ecs')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  body = json.loads(event['body'])
+                  logger.info(f"Parsed body: {json.dumps(body)}")
+                  
+                  event_type = body.get('eventType', '')
+                  logger.info(f"Event type: {event_type}")
+                  
+                  if event_type == 'ms.vss-pipelines.job-state-changed-event':
+                      job_state = body.get('resource', {}).get('job', {}).get('state', '')
+                      job_id = body.get('resource', {}).get('job', {}).get('id', '')
+                      run_id = body.get('resource', {}).get('run', {}).get('id', '')
+                      logger.info(f"Job state: '{job_state}' (type: {type(job_state)}), Job ID: {job_id}, Run ID: {run_id}")
+                      logger.info(f"Comparing '{job_state.lower()}' == 'waiting': {job_state.lower() == 'waiting'}")
+                      
+                      if job_state.lower() == 'waiting':
+                          logger.info(f"Job waiting for agent, scaling up with job ID: {job_id}")
+                          scale_up_with_job_id(job_id)
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({'message': f'Scaling up ECS service for job {job_id}'})
+                          }
+                      elif job_state.lower() == 'completed':
+                          logger.info(f"Job completed, stopping task for job ID: {job_id}")
+                          stop_task_by_job_id(job_id)
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({'message': f'Stopped task for job {job_id}'})
+                          }
+                      else:
+                          logger.info(f"Job state '{job_state}' (lower: '{job_state.lower()}') not handled, ignoring")
+                  else:
+                      logger.info(f"Event type '{event_type}' not handled")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({'message': 'Event acknowledged'})
+                  }
+                      
+              except Exception as e:
+                  logger.error(f"Error processing webhook: {str(e)}")
+                  logger.error(f"Full event: {json.dumps(event)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def scale_up_with_job_id(job_id):
+              cluster_name = os.environ['ECS_CLUSTER']
+              subnet_ids = os.environ.get('SUBNET_IDS', '').split(',')
+              security_group_id = os.environ.get('SECURITY_GROUP_ID', '')
+              
+              logger.info(f"Starting task with subnets: {subnet_ids}, security group: {security_group_id}")
+              
+              # Run task with job ID as tag
+              response = ecs_client.run_task(
+                  cluster=cluster_name,
+                  taskDefinition='azure-devops-agent',
+                  launchType='FARGATE',
+                  networkConfiguration={
+                      'awsvpcConfiguration': {
+                          'subnets': subnet_ids,
+                          'securityGroups': [security_group_id],
+                          'assignPublicIp': 'ENABLED'
+                      }
+                  },
+                  tags=[
+                      {
+                          'key': 'JobId',
+                          'value': str(job_id)
+                      },
+                      {
+                          'key': 'CreatedBy',
+                          'value': 'azure-devops-webhook'
+                      }
+                  ]
+              )
+              
+              task_arn = response['tasks'][0]['taskArn']
+              logger.info(f"Started task {task_arn} for job {job_id}")
+              
+          def stop_task_by_job_id(job_id):
+              cluster_name = os.environ['ECS_CLUSTER']
+              
+              # List tasks with job ID tag
+              response = ecs_client.list_tasks(
+                  cluster=cluster_name,
+                  desiredStatus='RUNNING'
+              )
+              
+              for task_arn in response['taskArns']:
+                  # Get task tags
+                  tags_response = ecs_client.list_tags_for_resource(
+                      resourceArn=task_arn
+                  )
+                  
+                  # Check if task has matching job ID
+                  for tag in tags_response['tags']:
+                      if tag['key'] == 'JobId' and tag['value'] == str(job_id):
+                          logger.info(f"Stopping task {task_arn} for completed job {job_id}")
+                          ecs_client.stop_task(
+                              cluster=cluster_name,
+                              task=task_arn,
+                              reason=f'Job {job_id} completed'
+                          )
+                          break
+
+  WebhookProcessorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookProcessor
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/POST/webhook"
+
+
+
+Outputs:
+  WebhookUrl:
+    Description: Webhook URL for Azure DevOps
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook"
+  
+  ApiKey:
+    Description: API Key for webhook authentication
+    Value: !Ref WebhookApiKey
+  
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster

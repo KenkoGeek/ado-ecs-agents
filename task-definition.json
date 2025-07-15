@@ -1,0 +1,42 @@
+{
+  "family": "azure-devops-agent",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "azure-devops-agent",
+      "image": "${ECR_IMAGE_URI}",
+      "essential": true,
+      "environment": [
+        {
+          "name": "AZP_URL",
+          "value": "${AZURE_DEVOPS_URL}"
+        },
+        {
+          "name": "AZP_TOKEN",
+          "value": "${AZURE_DEVOPS_PAT}"
+        },
+        {
+          "name": "AZP_POOL",
+          "value": "${AGENT_POOL_NAME}"
+        },
+        {
+          "name": "AZP_AGENT_NAME",
+          "value": "${AWS_STACK_NAME}-agent-${AWS_ACCOUNT_ID}"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "${LOG_GROUP_NAME}",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
